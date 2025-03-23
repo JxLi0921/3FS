@@ -15,6 +15,27 @@
 #include "lib/api/hf3fs_usrbio.h"
 #include "lib/common/Shm.h"
 
+bool IsDebugEnabled() {
+  static std::atomic<bool> cachedValue{false};
+  static std::atomic<std::chrono::steady_clock::time_point> lastCheck{std::chrono::steady_clock::now() -
+                                                                      std::chrono::seconds(10)};
+
+  auto now = std::chrono::steady_clock::now();
+  if (now - lastCheck.load() > std::chrono::seconds(1)) {
+    struct stat buffer;
+    auto newValue = (stat("/opt/3fs-usrbio-debug-enabled", &buffer) == 0);
+    lastCheck = now;
+    if (newValue != cachedValue.load()) {
+      XLOGF(INFO, "3fs-usrbio-debug enabled: {}", newValue);
+      cachedValue = newValue;
+    } else if (newValue) {
+      XLOG(INFO, "3fs-usrbio-debug enabled");
+    }
+  }
+
+  return cachedValue;
+}
+
 struct Hf3fsInitLib {
   Hf3fsInitLib() {
     auto v = getenv("HF3FS_USRBIO_LIB_LOG");
@@ -553,11 +574,20 @@ static int noFiles() {
 using Hf3fsRegisteredFds = std::vector<folly::atomic_shared_ptr<Hf3fsRegisteredFd>>;
 static Hf3fsRegisteredFds regfds(noFiles());
 
+#define USRBIO_ERRLOG_IF(cond, fmt, ...) \
+  if (IsDebugEnabled() && (cond)) {      \
+    XLOGF(ERR, fmt, ##__VA_ARGS__);      \
+  }
+
+#define USRBIO_ERRLOG(fmt, ...) \
+  if (IsDebugEnabled()) XLOGF(ERR, fmt, ##__VA_ARGS__)
+
 int hf3fs_reg_fd(int fd, uint64_t flags) {
   (void)flags;
 
   auto is3fs = hf3fs_is_hf3fs(fd);
   if (!is3fs || fd >= (int)regfds.size()) {
+    USRBIO_ERRLOG("hf3fs_reg_fd: error on hf3fs_is_hf3fs, is3fs={}, fd={}, regfds.size()={}", is3fs, fd, regfds.size());
     return EBADF;
   } else if (regfds[fd].load()) {
     return EINVAL;
@@ -566,11 +596,13 @@ int hf3fs_reg_fd(int fd, uint64_t flags) {
   struct statx stx;
   auto sres = statx(fd, "", AT_EMPTY_PATH | AT_STATX_DONT_SYNC, STATX_INO, &stx);
   if (sres < 0) {
+    USRBIO_ERRLOG("hf3fs_reg_fs: statx failed with errno {}", errno);
     return errno;
   }
 
   auto dupfd = dup(fd);
   if (dupfd < 0) {
+    USRBIO_ERRLOG("hf3fs_reg_fs: dup failed with errno {}", errno);
     return errno;
   } else if (regfds[dupfd].load()) {
     close(dupfd);
